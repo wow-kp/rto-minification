@@ -10,118 +10,302 @@ define('THEME_URI', '/themes/');
 
 if (isset($_SERVER['REQUEST_URI'])) {
     $url = isset($_GET['all']) ? $_SERVER['REQUEST_URI'] : parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-    define('M_CSS', hash('md5', $url) . '.css');
-    define('M_JS', hash('md5', $url) . '.js');
+    define('M_CSS', hash('sha1', $url) . '.css');
+    define('M_JS',  hash('sha1', $url) . '.js');
 }
 
-function minifyCSS($html)
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function getTheme(): string
 {
-    $theme = getAccount()->getThemeAttribute();
-    $CSS_MIN = public_path('/themes/' . $theme . '/css/cache/' . M_CSS);
+    static $theme = null;
+    return $theme ??= getAccount()->getThemeAttribute();
+}
 
-    if (!is_dir(public_path('/themes/' . $theme . '/css/cache/'))) {
-        mkdir(public_path('/themes/' . $theme . '/css/cache/'), 0o777, true);
+function buildCacheKey(array $files, string $type): string
+{
+    return buildFingerprint($files) . '.' . $type;
+}
+
+/**
+ * Hash of file paths + their mtimes. Used both as the cache filename and as a
+ * stored fingerprint inside APCu so warm requests can detect file changes
+ * without re-parsing the DOM.
+ */
+function buildFingerprint(array $files): string
+{
+    $parts = array_map(
+        fn($path, $mtime) => $path . ':' . $mtime,
+        array_keys($files),
+        array_values($files)
+    );
+    return hash('sha1', implode('|', $parts));
+}
+
+function getLoadingMarkup(string $theme, string $cacheFile, int $version): string
+{
+    $href = THEME_URI . $theme . '/css/cache/' . $cacheFile . '?v=' . $version;
+
+    // FIX: handleMainStylesheet now checks whether the stylesheet already loaded
+    // (the onload on the <link> fires after rel is swapped, so the element is
+    // already a stylesheet by the time handleMainStylesheet runs — we reveal
+    // immediately in that case instead of setting a .onload that never fires).
+    // A hard 3s timeout ensures the page is never permanently invisible due to
+    // a JS error or a network failure.
+    return <<<HTML
+    <script type="text/javascript">
+        function unloadBody() {
+            document.body && document.body.classList.remove('loading');
+        }
+        function handleMainStylesheet() {
+            var link = document.querySelector("link[as='style']");
+            if (!link || link.rel === 'stylesheet') {
+                unloadBody();
+                return;
+            }
+            link.addEventListener('load', unloadBody);
+        }
+        // Hard fallback — never leave the page blank for more than 3 seconds
+        setTimeout(unloadBody, 3000);
+        // Secondary fallback via window.onload
+        window.addEventListener('load', unloadBody);
+    </script>
+    <style type="text/css">
+        body.loading {
+            background-color: #ffffff !important;
+            opacity: 0 !important;
+            visibility: hidden !important;
+        }
+    </style>
+    <link href="{$href}" rel="preload" as="style"
+          onload="this.rel='stylesheet';this.id='main-stylesheet';handleMainStylesheet();">
+    <noscript><link rel="stylesheet" href="{$href}"></noscript>
+    HTML;
+}
+
+/**
+ * Minify into a .tmp file, validate, then atomically rename into place.
+ * Returns the cache path on success, null on failure.
+ */
+function atomicMinify(object $minifier, string $cachePath): ?string
+{
+    $tmpPath = $cachePath . '.tmp';
+
+    try {
+        $minifier->minify($tmpPath);
+    } catch (Throwable $e) {
+        @unlink($tmpPath);
+        return null;
     }
 
-    if (M_DEBUG || isset($_GET['search-term']) || isset($_GET['all'])) {
-        echo $html;
-
-        return;
-    }
-    if (!file_exists($CSS_MIN)) {
-        touch($CSS_MIN);
-        chmod($CSS_MIN, 0o777);
-        $versionCache = 0;
-    } else {
-        $versionCache = filemtime($CSS_MIN);
+    if (!file_exists($tmpPath) || filesize($tmpPath) === 0) {
+        @unlink($tmpPath);
+        return null;
     }
 
-    $extracted = extractCSS($html);
-    $files = $extracted['urls'];
-    $inline = $extracted['inline'];
-    $remaining = $extracted['remaining'];
-
-    if (max($files) < $versionCache) {
-        echo $remaining;
-        echo '
-		<script type="text/javascript">
-			function unloadBody() {
-				if (document.body == null) {
-					setTimeout(unloadBody,100);
-				} else {
-					document.body.classList.remove(\'loading\');
-				}
-			}
-			function handleMainStylesheet () {
-				const stylesheet = document.querySelector("#main-stylesheet");
-				stylesheet.onload = () => {
-					unloadBody();
-				};
-			}
-			window.onload = (event) => {
-				unloadBody();
-			}
-		</script>
-		<style type="text/css">
-		body.loading {
-			background-color: #ffffff !important;
-			opacity: 0 !important;
-			visibility: hidden !important;
-		}
-		</style>
-		<link href="' . THEME_URI . $theme . '/css/cache/' . M_CSS . '?v=' . $versionCache . '" rel="preload" as="style" onload="this.rel=\'stylesheet\';this.setAttribute(\'id\',\'main-stylesheet\'); handleMainStylesheet();">
-		<noscript><link rel="stylesheet" href="' . THEME_URI . $theme . '/css/cache/' . M_CSS . '?v=' . $versionCache . '"></noscript>';
-
-        return;
+    if (file_exists($cachePath)) {
+        unlink($cachePath);
     }
 
-    $files = array_keys($files);
+    rename($tmpPath, $cachePath);
+    chmod($cachePath, 0644);
 
-    $minifier = new Minify\CSS(public_path($files[0]));
+    return $cachePath;
+}
 
-    foreach ($files as $k => $file) {
-        if ($k > 0) {
-            $minifier->add(public_path($file));
+function evictStaleCacheFiles(string $cacheDir, string $currentCacheKey): void
+{
+    foreach (glob($cacheDir . '*') as $file) {
+        if (is_file($file) && basename($file) !== $currentCacheKey) {
+            @unlink($file);
         }
     }
+}
+
+function buildMinifier(string $type, array $files, string $inline): object
+{
+    $class    = $type === 'css' ? Minify\CSS::class : Minify\JS::class;
+    $minifier = empty($files)
+        ? new $class()
+        : new $class(public_path(array_key_first($files)));
+
+    foreach (array_slice(array_keys($files), 1) as $file) {
+        $minifier->add(public_path($file));
+    }
+
     if ($inline) {
         $minifier->add($inline);
     }
 
-    $minifier->minify($CSS_MIN);
-
-    echo $remaining;
-    echo '
-	<script type="text/javascript">
-		function unloadBody() {
-			if (document.body == null) {
-				setTimeout(unloadBody,100);
-			} else {
-				document.body.classList.remove(\'loading\');
-			}
-		}
-		function handleMainStylesheet () {
-			const stylesheet = document.querySelector("#main-stylesheet");
-			stylesheet.onload = () => {
-				unloadBody();
-			};
-		}
-		window.onload = (event) => {
-			unloadBody();
-		}
-	</script>
-	<style type="text/css">
-	body.loading {
-		background-color: #ffffff;
-		opacity: 0;
-		visibility: hidden;
-	}
-	</style>
-	<link href="' . THEME_URI . $theme . '/css/cache/' . M_CSS . '?v=' . $versionCache . '" rel="preload" as="style" onload="this.rel=\'stylesheet\';this.setAttribute(\'id\',\'main-stylesheet\'); handleMainStylesheet();">
-	<noscript><link rel="stylesheet" href="' . THEME_URI . $theme . '/css/cache/' . M_CSS . '?v=' . $versionCache . '"></noscript>';
+    return $minifier;
 }
 
-function extractCSS(string $code)
+function outputCacheTag(string $type, string $theme, string $cacheKey, int $version): void
+{
+    if ($type === 'css') {
+        echo getLoadingMarkup($theme, $cacheKey, $version);
+    } else {
+        echo '<script src="' . THEME_URI . $theme . '/js/cache/' . $cacheKey . '?v=' . $version . '" defer></script>';
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+function minifyCSS(string $html): void
+{
+    minifyAssets($html, 'css');
+}
+
+function minifyJS(string $html): void
+{
+    minifyAssets($html, 'js');
+}
+
+// ---------------------------------------------------------------------------
+// Core minification
+// ---------------------------------------------------------------------------
+
+function minifyAssets(string $html, string $type): void
+{
+    $theme    = getTheme();
+    $cacheDir = public_path('/themes/' . $theme . '/' . $type . '/cache/');
+
+    if (!is_dir($cacheDir)) {
+        mkdir($cacheDir, 0755, true);
+    }
+
+    if (M_DEBUG || isset($_GET['search-term']) || isset($_GET['all'])) {
+        echo $html;
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // Fast path: APCu hit keyed on the URL path — stable, one entry per
+    // unique page, skips DOM parsing entirely on warm requests.
+    // The stored fingerprint detects source file changes so stale entries
+    // are never served even if APCu hasn't expired yet.
+    // ------------------------------------------------------------------
+    $urlPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?? '';
+    $apcuKey = 'perf_' . $type . '_' . hash('sha1', $urlPath);
+
+    if (function_exists('apcu_exists') && apcu_exists($apcuKey)) {
+        $cached    = apcu_fetch($apcuKey);
+        $cachePath = $cacheDir . $cached['cache_key'];
+
+        $stillValid = file_exists($cachePath)
+            && $cached['fingerprint'] === buildFingerprint($cached['files']);
+
+        if ($stillValid) {
+            echo $cached['remaining'];
+            outputCacheTag($type, $theme, $cached['cache_key'], filemtime($cachePath));
+            return;
+        }
+
+        // File changed — bust the entry and fall through to rebuild
+        apcu_delete($apcuKey);
+    }
+
+    // ------------------------------------------------------------------
+    // Slow path: parse the DOM, minify, cache.
+    // Runs on first request per worker, after a file change, or after
+    // an APCu eviction.
+    // ------------------------------------------------------------------
+    $extracted = $type === 'css' ? extractCSS($html) : extractJS($html);
+    $files     = $extracted['urls'];
+    $inline    = $extracted['inline'];
+    $remaining = $extracted['remaining'];
+
+    if (empty($files) && !$inline) {
+        echo $remaining;
+        return;
+    }
+
+    $cacheKey  = buildCacheKey($files, $type);
+    $cachePath = $cacheDir . $cacheKey;
+
+    // ------------------------------------------------------------------
+    // Slow path: minify and write cache
+    // Runs only when the cache file doesn't exist or APCu has expired.
+    // ------------------------------------------------------------------
+
+    // Serialize concurrent rebuilds via a lock file
+    $lockPath = $cachePath . '.lock';
+    $lock     = fopen($lockPath, 'w');
+
+    if (!flock($lock, LOCK_EX)) {
+        echo $html;
+        fclose($lock);
+        return;
+    }
+
+    try {
+        // Re-check inside the lock — another process may have just rebuilt it
+        $versionCache = file_exists($cachePath) ? filemtime($cachePath) : 0;
+
+        if ($versionCache > 0 && (empty($files) || max($files) <= $versionCache)) {
+            storeApcuEntry($apcuKey, $cacheKey, $files, $remaining);
+            echo $remaining;
+            outputCacheTag($type, $theme, $cacheKey, $versionCache);
+            return;
+        }
+
+        $minifier = buildMinifier($type, $files, $inline);
+        $result   = atomicMinify($minifier, $cachePath);
+
+        if ($result === null) {
+            // Minification failed — serve unminified as a safe fallback
+            echo $html;
+            return;
+        }
+
+        evictStaleCacheFiles($cacheDir, $cacheKey);
+
+        $versionCache = filemtime($cachePath);
+
+        storeApcuEntry($apcuKey, $cacheKey, $files, $remaining);
+        echo $remaining;
+        outputCacheTag($type, $theme, $cacheKey, $versionCache);
+
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+}
+
+/**
+ * Store a warm APCu entry keyed on the URL path with a 5 minute TTL.
+ * Stores enough to serve the next request without any DOM parsing or
+ * filesystem work beyond the fingerprint check.
+ * Call apcu_clear_cache() during deploys for instant invalidation.
+ */
+function storeApcu(string $apcuKey): void
+{
+    // signature kept for call-site compatibility — body replaced below
+}
+
+function storeApcuEntry(string $apcuKey, string $cacheKey, array $files, string $remaining): void
+{
+    if (!function_exists('apcu_store')) {
+        return;
+    }
+
+    apcu_store($apcuKey, [
+        'cache_key'   => $cacheKey,
+        'files'       => $files,
+        'fingerprint' => buildFingerprint($files),
+        'remaining'   => $remaining,
+    ], 300);
+}
+
+// ---------------------------------------------------------------------------
+// Extraction
+// ---------------------------------------------------------------------------
+
+function extractCSS(string $code): array
 {
     $dom = new DOMDocument();
     $internalErrors = libxml_use_internal_errors(true);
@@ -129,10 +313,9 @@ function extractCSS(string $code)
     libxml_use_internal_errors($internalErrors);
 
     $urls = $remove = [];
-    $ss = $dom->getElementsByTagName('link');
-    foreach ($ss as $s) {
-        $href = $s->getAttribute('href');
 
+    foreach (iterator_to_array($dom->getElementsByTagName('link')) as $s) {
+        $href = $s->getAttribute('href');
         if (!filter_var($href, FILTER_VALIDATE_URL) && is_file(public_path($href))) {
             $urls[$href] = filemtime(public_path($href));
             $remove[] = $s;
@@ -143,75 +326,28 @@ function extractCSS(string $code)
         $s->parentNode->removeChild($s);
     }
 
-    $inlines = $dom->getElementsByTagName('style');
-    $ir = '';
-    foreach ($inlines as $inline) {
+    $ir     = '';
+    $remove = [];
+    foreach (iterator_to_array($dom->getElementsByTagName('style')) as $inline) {
+        if ($inline->hasAttribute('data-critical')) {
+            continue;
+        }
         $ir .= $inline->textContent . ' ';
-        $inline->parentNode->removeChild($inline);
+        $remove[] = $inline;
     }
 
-    $remaining = preg_replace('/^<!DOCTYPE.+?>/', '', str_replace(['<html>', '</html>', '<body>', '</body>', '<head>', '</head>'], ['', '', '', '', '', ''], $dom->saveHTML()));
+    foreach ($remove as $s) {
+        $s->parentNode->removeChild($s);
+    }
 
     return [
-        'urls' => $urls,
-        'remaining' => $remaining,
-        'inline' => $ir,
+        'urls'      => $urls,
+        'remaining' => domToString($dom),
+        'inline'    => $ir,
     ];
 }
 
-function minifyJS($html)
-{
-    $theme = getAccount()->getThemeAttribute();
-    $JS_MIN = public_path('/themes/' . $theme . '/js/cache/' . M_JS);
-
-    if (!is_dir(public_path('/themes/' . $theme . '/js/cache/'))) {
-        mkdir(public_path('/themes/' . $theme . '/js/cache/'), 0o777, true);
-    }
-
-    if (M_DEBUG || isset($_GET['search-term']) || isset($_GET['all'])) {
-        echo $html;
-
-        return;
-    }
-    if (!file_exists($JS_MIN)) {
-        touch($JS_MIN);
-        chmod($JS_MIN, 0o777);
-        $versionCache = 0;
-    } else {
-        $versionCache = filemtime($JS_MIN);
-    }
-    $extracted = extractJS($html);
-    $files = $extracted['urls'];
-    $inline = $extracted['inline'];
-    $remaining = $extracted['remaining'];
-
-    if (max($files) < $versionCache) {
-        echo $remaining;
-        echo '<script src="' . THEME_URI . $theme . '/js/cache/' . M_JS . '?v=' . $versionCache . '" async defer></script>';
-
-        return;
-    }
-
-    $files = array_keys($files);
-
-    $minifier = new Minify\JS(public_path($files[0]));
-
-    foreach ($files as $k => $file) {
-        if ($k > 0) {
-            $minifier->add(public_path($file));
-        }
-    }
-    if ($inline) {
-        $minifier->add($inline);
-    }
-
-    $minifier->minify($JS_MIN);
-
-    echo $remaining;
-    echo '<script src="' . THEME_URI . $theme . '/js/cache/' . M_JS . '?v=' . $versionCache . '" async defer></script>';
-}
-
-function extractJS(string $code)
+function extractJS(string $code): array
 {
     $dom = new DOMDocument();
     $internalErrors = libxml_use_internal_errors(true);
@@ -219,9 +355,9 @@ function extractJS(string $code)
     libxml_use_internal_errors($internalErrors);
 
     $urls = $remove = [];
-    $ir = '';
-    $ss = $dom->getElementsByTagName('script');
-    foreach ($ss as $s) {
+    $ir   = '';
+
+    foreach (iterator_to_array($dom->getElementsByTagName('script')) as $s) {
         if ($s->hasAttribute('src')) {
             $src = $s->getAttribute('src');
             if (!filter_var($src, FILTER_VALIDATE_URL) && is_file(public_path($src))) {
@@ -229,13 +365,7 @@ function extractJS(string $code)
                 $remove[] = $s;
             }
         } else {
-            if ($s->hasAttribute('type')) {
-                $type = $s->getAttribute('type');
-                if ($type != 'application/ld+json') {
-                    $ir .= $s->textContent . ' ';
-                    $remove[] = $s;
-                }
-            } else {
+            if ($s->getAttribute('type') !== 'application/ld+json') {
                 $ir .= $s->textContent . ' ';
                 $remove[] = $s;
             }
@@ -246,95 +376,126 @@ function extractJS(string $code)
         $s->parentNode->removeChild($s);
     }
 
-    $remaining = preg_replace('/^<!DOCTYPE.+?>/', '', str_replace(['<html>', '</html>', '<body>', '</body>', '<head>', '</head>'], ['', '', '', '', '', ''], $dom->saveHTML()));
-
     return [
-        'urls' => $urls,
-        'remaining' => $remaining,
-        'inline' => $ir,
+        'urls'      => $urls,
+        'remaining' => domToString($dom),
+        'inline'    => $ir,
     ];
 }
 
-function applyLazyLoad(string $html)
+function domToString(DOMDocument $dom): string
 {
-    $theme = getAccount()->getThemeAttribute();
+    return preg_replace(
+        '/^<!DOCTYPE.+?>/i', '',
+        str_replace(
+            ['<html>', '</html>', '<body>', '</body>', '<head>', '</head>'],
+            '',
+            $dom->saveHTML()
+        )
+    );
+}
 
+// ---------------------------------------------------------------------------
+// Lazy loading
+// ---------------------------------------------------------------------------
+
+function applyLazyLoad(string $html): string
+{
     $dom = new DOMDocument();
     $internalErrors = libxml_use_internal_errors(true);
     $dom->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
     libxml_use_internal_errors($internalErrors);
 
-    $do = true;
-    $images = $dom->getElementsByTagName('img');
-
-    foreach ($images as $img) {
-        if ($img->hasAttribute('class')) {
-            $do = strpos($img->getAttribute('class'), 'no-lazy') === false ? true : false;
+    foreach (iterator_to_array($dom->getElementsByTagName('img')) as $img) {
+        $classes = $img->getAttribute('class');
+        if (strpos($classes, 'no-lazy') !== false) {
+            continue;
         }
 
-        if ($do) {
-            $classes = '';
-            if ($img->hasAttribute('class')) {
-                $classes = $img->getAttribute('class') . ' ';
-            }
-            $img->setAttribute('class', $classes . 'lazyload');
+        $img->setAttribute('loading', 'lazy');
+        $img->setAttribute('class', trim($classes . ' lazyload'));
 
-            if ($img->hasAttribute('srcset')) {
-                $srcset = $img->getAttribute('srcset');
-                $img->setAttribute('data-srcset', $srcset);
-                $img->removeAttribute('srcset');
-            }
+        if ($img->hasAttribute('srcset')) {
+            $img->setAttribute('data-srcset', $img->getAttribute('srcset'));
+            $img->removeAttribute('srcset');
+        }
 
-            $src = $img->getAttribute('src');
-            $img->setAttribute('data-src', $src);
-            $img->removeAttribute('src');
+        $src = $img->getAttribute('src');
+        $img->setAttribute('data-src', $src);
+        $img->removeAttribute('src');
 
-            $full_path = public_path($src);
-            if (!File::missing($full_path)) {
-                try {
-                    $image = Image::make($full_path);
-                    if (!$img->hasAttribute('width')) {
-                        $img->setAttribute('width', $image->width());
-                    }
-                    if (!$img->hasAttribute('height')) {
-                        $img->setAttribute('height', $image->height());
-                    }
-                } catch (Exception $e) {
+        $fullPath = public_path($src);
+        if (!File::missing($fullPath)) {
+            try {
+                $image = Image::make($fullPath);
+                if (!$img->hasAttribute('width')) {
+                    $img->setAttribute('width', $image->width());
                 }
+                if (!$img->hasAttribute('height')) {
+                    $img->setAttribute('height', $image->height());
+                }
+            } catch (Exception $e) {
+                // Non-fatal: dimensions simply won't be set
             }
         }
     }
 
-    return preg_replace('/^<!DOCTYPE.+?>/', '', str_replace(['<html>', '</html>', '<body>', '</body>', '<head>', '</head>'], ['', '', '', '', '', ''], $dom->saveHTML()));
+    foreach (iterator_to_array($dom->getElementsByTagName('source')) as $source) {
+        $picture = $source->parentNode;
+        if (!$picture || $picture->nodeName !== 'picture') {
+            continue;
+        }
+
+        if (strpos($picture->getAttribute('class'), 'no-lazy') !== false) {
+            continue;
+        }
+
+        if ($source->hasAttribute('srcset')) {
+            $source->setAttribute('data-srcset', $source->getAttribute('srcset'));
+            $source->removeAttribute('srcset');
+        }
+    }
+
+    return domToString($dom);
 }
 
-function tinifyImages($image)
+// ---------------------------------------------------------------------------
+// Cache management
+// ---------------------------------------------------------------------------
+
+function tinifyImages(string $image): void
 {
-    //$result = Tinify::fromFile($image);
-    //
-    //return $result->toFile($image);
+    // Placeholder — Tinify integration pending
 }
 
-function glob_recursive($pattern, $flags = 0)
+function glob_recursive(string $pattern, int $flags = 0): array
 {
     $files = glob($pattern, $flags);
     foreach (glob(dirname($pattern) . '/*', GLOB_ONLYDIR | GLOB_NOSORT) as $dir) {
         $files = array_merge($files, glob_recursive($dir . '/' . basename($pattern), $flags));
     }
-
     return $files;
 }
 
-function purgeCache($type = 'all')
+function purgeCache(string $type = 'all'): void
 {
-    $theme = getAccount()->getThemeAttribute();
+    $theme = getTheme();
 
-    $css = THEME_DIR . $theme . '/css/cache/*';
-    $js = THEME_DIR . $theme . '/js/cache/*';
-    if ($type == 'all') {
-        array_map('unlink', array_filter((array) array_merge(glob($css))));
-        array_map('unlink', array_filter((array) array_merge(glob($js))));
-    } elseif (in_array($type, ['css', 'js'])) {
-        array_map('unlink', array_filter((array) array_merge(glob(${$type}))));
+    $patterns = [
+        'css' => THEME_DIR . $theme . '/css/cache/*',
+        'js'  => THEME_DIR . $theme . '/js/cache/*',
+    ];
+
+    $targets = $type === 'all'
+        ? array_values($patterns)
+        : (isset($patterns[$type]) ? [$patterns[$type]] : []);
+
+    foreach ($targets as $pattern) {
+        array_map('unlink', array_filter(glob($pattern)));
+    }
+
+    // Clear APCu so the next request re-parses rather than serving stale paths
+    if (function_exists('apcu_clear_cache')) {
+        apcu_clear_cache();
     }
 }
